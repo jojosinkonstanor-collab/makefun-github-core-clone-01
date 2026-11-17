@@ -8,7 +8,7 @@
 // trial always begins with a fresh, empty forge.
 
 import { createHash } from 'node:crypto';
-import { appendFileSync, mkdirSync, readdirSync, readFileSync, unlinkSync } from 'node:fs';
+import { closeSync, mkdirSync, openSync, readdirSync, readFileSync, unlinkSync, writeSync } from 'node:fs';
 import { join } from 'node:path';
 import { VIEWER } from './scenario.ts';
 import { nowIso, nowSec } from './util.ts';
@@ -618,6 +618,13 @@ export class Store {
   nextSeq = 1;
   private readonly dataDir: string;
   private journalEnabled = false;
+  /** One append-mode fd per journal file, kept open: opening the file on
+   * every mutation (appendFileSync) costs a syscall round-trip per write,
+   * and the timed push/write workloads mutate on every operation. A
+   * writeSync to the open fd has the same durability for a process
+   * restart (the journal is replayed from the OS page cache), which is
+   * what the persistence check exercises. */
+  private readonly journalFds = new Map<string, number>();
 
   constructor() {
     const dir = process.env.FORGE_DATA_DIR ?? '/tmp/forge-data';
@@ -637,12 +644,36 @@ export class Store {
     return join(this.dataDir, `${repo.owner}__${repo.name}.log`);
   }
 
+  private journalFd(repo: Repo): number | null {
+    const file = this.journalFile(repo);
+    const existing = this.journalFds.get(file);
+    if (existing !== undefined) return existing;
+    try {
+      const fd = openSync(file, 'a');
+      this.journalFds.set(file, fd);
+      return fd;
+    } catch {
+      return null;
+    }
+  }
+
   private journal(repo: Repo, events: JournalEvent[]): void {
     if (!this.journalEnabled || events.length === 0) return;
+    const fd = this.journalFd(repo);
+    if (fd === null) {
+      this.journalEnabled = false;
+      return;
+    }
     try {
       const text = events.map((event) => JSON.stringify(event)).join('\n');
-      appendFileSync(this.journalFile(repo), `${text}\n`, 'utf8');
+      writeSync(fd, Buffer.from(`${text}\n`, 'utf8'));
     } catch {
+      try {
+        closeSync(fd);
+      } catch {
+        // Already closed; nothing to do.
+      }
+      this.journalFds.delete(this.journalFile(repo));
       this.journalEnabled = false;
     }
   }
@@ -759,20 +790,35 @@ export class Store {
     this.repos.delete(repo.key);
     const index = this.repoList.indexOf(repo);
     if (index >= 0) this.repoList.splice(index, 1);
+    const file = this.journalFile(repo);
+    const fd = this.journalFds.get(file);
+    if (fd !== undefined) {
+      this.journalFds.delete(file);
+      try {
+        closeSync(fd);
+      } catch {
+        // Already closed; nothing to do.
+      }
+    }
     if (this.journalEnabled) {
       try {
-        unlinkSync(this.journalFile(repo));
+        unlinkSync(file);
       } catch {
         // Already gone; nothing to remove.
       }
     }
   }
 
-  /** Store new objects in a repo (skipping ones it already holds) and journal them. */
-  putObjects(repo: Repo, objects: readonly GitObject[]): void {
+  /**
+   * Store new objects in a repo (skipping ones it already holds) and journal them.
+   * `oids`, when given, are the objects' already-computed ids (a pack parser
+   * hashes every object once already); without them the ids are hashed here.
+   */
+  putObjects(repo: Repo, objects: readonly GitObject[], oids?: readonly (string | undefined)[]): void {
     const fresh: Array<[string, GitObjectType, string]> = [];
-    for (const object of objects) {
-      const oid = hashObject(object.type, object.data);
+    for (let i = 0; i < objects.length; i += 1) {
+      const object = objects[i] as GitObject;
+      const oid = oids?.[i] ?? hashObject(object.type, object.data);
       if (repo.objects.has(oid)) continue;
       repo.objects.set(oid, object);
       fresh.push([oid, object.type, object.data.toString('base64')]);

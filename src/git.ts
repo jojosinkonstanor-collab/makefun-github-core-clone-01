@@ -173,16 +173,20 @@ export function applyDelta(base: Buffer, delta: Buffer): Buffer {
 /**
  * Parse a PACK v2 buffer into full objects. Delta bases may come from the same
  * pack (OFS_DELTA by byte offset, REF_DELTA by oid) or, for thin packs, from
- * `lookup` — the receiving repository's object store.
+ * `lookup` — the receiving repository's object store. Each returned object
+ * carries its oid, computed once here, so the caller need not hash it again.
  */
-export function parsePack(buffer: Buffer, lookup: (oid: string) => GitObject | undefined): GitObject[] {
+export function parsePack(
+  buffer: Buffer,
+  lookup: (oid: string) => GitObject | undefined,
+): Array<GitObject & { oid: string }> {
   if (buffer.length < 12 || buffer.subarray(0, 4).toString('ascii') !== 'PACK') {
     throw new Error('not a packfile');
   }
   const version = buffer.readUInt32BE(4);
   const count = buffer.readUInt32BE(8);
   if (version !== 2) throw new Error(`unsupported pack version ${version}`);
-  const objects: GitObject[] = [];
+  const objects: Array<GitObject & { oid: string }> = [];
   const byOffset = new Map<number, GitObject>();
   const byOid = new Map<string, GitObject>();
   let offset = 12;
@@ -197,8 +201,7 @@ export function parsePack(buffer: Buffer, lookup: (oid: string) => GitObject | u
       offset += offsetConsumed;
       const base = byOffset.get(startOffset - baseOffset);
       if (!base) throw new Error('ofs-delta base not found in pack');
-      const used = inflatedLength(buffer, offset);
-      const inflated = inflateSync(buffer.subarray(offset, offset + used));
+      const [used, inflated] = inflateObject(buffer, offset, size);
       offset += used;
       data = applyDelta(base.data, inflated);
       type = base.type;
@@ -207,26 +210,98 @@ export function parsePack(buffer: Buffer, lookup: (oid: string) => GitObject | u
       offset += 20;
       const base = byOid.get(baseOid) ?? lookup(baseOid);
       if (!base) throw new Error(`ref-delta base ${baseOid} is not available`);
-      const used = inflatedLength(buffer, offset);
-      const inflated = inflateSync(buffer.subarray(offset, offset + used));
+      const [used, inflated] = inflateObject(buffer, offset, size);
       offset += used;
       data = applyDelta(base.data, inflated);
       type = base.type;
     } else {
       type = PACK_OBJECT_TYPES[typeId] as GitObjectType;
       if (!type) throw new Error(`unknown pack object type ${typeId}`);
-      const used = inflatedLength(buffer, offset);
-      data = inflateSync(buffer.subarray(offset, offset + used));
+      const [used, inflated] = inflateObject(buffer, offset, size);
+      data = inflated;
       offset += used;
       if (data.length !== size) throw new Error('object size mismatch in pack');
     }
-    const object: GitObject = { type, data };
     const oid = hashObject(type, data);
+    const object: GitObject & { oid: string } = { type, data, oid };
     objects.push(object);
     byOffset.set(startOffset, object);
     byOid.set(oid, object);
   }
   return objects;
+}
+
+/** Adler-32 of a buffer: the checksum a zlib stream ends with, big-endian. */
+function adler32(data: Buffer): number {
+  const MOD = 65521;
+  let a = 1;
+  let b = 0;
+  let i = 0;
+  // Defer the modulus (safe for 5552 bytes at a time: b stays below 2^31).
+  while (i < data.length) {
+    const end = Math.min(data.length, i + 5552);
+    while (i < end) {
+      a += data[i] as number;
+      b += a;
+      i += 1;
+    }
+    a %= MOD;
+    b %= MOD;
+  }
+  return ((b << 16) | a) >>> 0;
+}
+
+/**
+ * Inflate the one zlib stream starting at `offset`, whose inflated size is
+ * `expectedSize`. Fast path: inflate a bounded window once — inflateSync
+ * ignores trailing bytes, so one call yields the data when the window holds
+ * the whole stream — then locate the stream's end from its Adler-32 trailer
+ * (the four bytes ending the stream are the Adler-32 of the inflated data).
+ * When the trailer occurs exactly once inside the window it must be the
+ * stream's end (the window holds the whole stream, so its trailer is in
+ * the window); with several candidates each is verified by inflating that
+ * exact prefix. Falls back to the probing search when the window does not
+ * hold the whole stream or no candidate verifies. Returns
+ * [consumedBytes, inflatedData].
+ */
+function inflateObject(buffer: Buffer, offset: number, expectedSize: number): [number, Buffer] {
+  const remaining = buffer.length - offset;
+  const window = Math.min(remaining, Math.max(8192, expectedSize * 3 + 256));
+  if (window > 0) {
+    try {
+      const data = inflateSync(buffer.subarray(offset, offset + window));
+      if (data.length === expectedSize) {
+        const needle = Buffer.alloc(4);
+        needle.writeUInt32BE(adler32(data), 0);
+        const windowEnd = offset + window;
+        const first = buffer.indexOf(needle, offset);
+        if (first >= 0 && first + 4 <= windowEnd) {
+          const second = buffer.indexOf(needle, first + 1);
+          if (second < 0 || second + 4 > windowEnd) {
+            return [first - offset + 4, data];
+          }
+          let searchFrom = first;
+          for (let tries = 0; tries < 8; tries += 1) {
+            const at = searchFrom;
+            const len = at - offset + 4;
+            try {
+              const check = inflateSync(buffer.subarray(offset, offset + len));
+              if (check.length === expectedSize && check.equals(data)) return [len, data];
+            } catch {
+              // Not the true end; keep looking for a later occurrence.
+            }
+            const next = buffer.indexOf(needle, at + 1);
+            if (next < 0 || next + 4 > windowEnd) break;
+            searchFrom = next;
+          }
+        }
+      }
+    } catch {
+      // The window did not hold the whole stream: fall through to probing.
+    }
+  }
+  const used = inflatedLength(buffer, offset);
+  return [used, inflateSync(buffer.subarray(offset, offset + used))];
 }
 
 /** How many bytes of `buffer` starting at `offset` form one zlib stream. */
@@ -741,7 +816,7 @@ export async function handleReceivePack(
   req: IncomingMessage,
   res: ServerResponse,
   repo: Repo,
-  store: { putObjects: (repo: Repo, objects: readonly GitObject[]) => void; setRef: (repo: Repo, ref: string, oid: string | null) => void },
+  store: { putObjects: (repo: Repo, objects: readonly GitObject[], oids?: readonly (string | undefined)[]) => void; setRef: (repo: Repo, ref: string, oid: string | null) => void },
 ): Promise<void> {
   const body = await readBody(req);
   const { items, endOffset } = parsePktLines(body);
@@ -763,8 +838,13 @@ export async function handleReceivePack(
   if (packBytes.length > 0) {
     try {
       const objects = parsePack(packBytes, (oid) => repo.objects.get(oid));
-      // Objects are stored even for refs that end up refused.
-      store.putObjects(repo, objects);
+      // Objects are stored even for refs that end up refused; their ids were
+      // already computed while parsing the pack, so they are not hashed again.
+      store.putObjects(
+        repo,
+        objects,
+        objects.map((object) => object.oid),
+      );
     } catch (err) {
       unpackError = err instanceof Error ? err.message : 'unpack failed';
     }
